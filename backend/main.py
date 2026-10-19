@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import pandas as pd
@@ -6,9 +7,11 @@ import io
 import asyncio
 import random
 import os
+import json
 from dotenv import load_dotenv 
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
 
-# Import your real scraping logic
 from scraper import check_availability
 
 load_dotenv()
@@ -27,6 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Chunked Transfer Encoding (Streaming)
 @app.post("/api/scan")
 async def process_scan(
     file: UploadFile = File(...),
@@ -44,46 +48,65 @@ async def process_scan(
     run_response = supabase.table("automation_runs").insert({
         "user_id": user_id,
         "filename": file.filename,
-        "total_locations": total_records
+        "total_locations": total_records,
+        "title": f"Run - {file.filename}"
     }).execute()
     
     run_id = run_response.data[0]['id']
 
-    final_results = []
-    
-    for index, row in df.iterrows():
-        lat = row['Latitude']
-        lon = row['Longitude']
-        product = row['Product_Name']
-        
-        # Call the real scraper from scraper.py
-        status = check_availability(lat, lon, product)
-        
-        result_entry = {
-            "run_id": run_id,
-            "product_name": product,
-            "latitude": lat,
-            "longitude": lon,
-            "status": status
-        }
-        final_results.append(result_entry)
-        
-        # Save dynamically to DB
-        supabase.table("automation_results").insert(result_entry).execute()
+    # Define an asynchronous generator to yield results line by line
+    async def event_stream():
+        # Send initial metadata to the frontend
+        yield json.dumps({
+            "type": "init", 
+            "run_id": run_id, 
+            "total_locations": total_records
+        }) + "\n"
 
-        # Non-blocking random delay (3 to 6 seconds) to protect your IP
-        await asyncio.sleep(random.uniform(3.0, 6.0))
+        current_count = 0
 
-    ui_results = []
-    for item in final_results:
-        ui_results.append({
-            "Product_Name": item["product_name"],
-            "Latitude": item["latitude"],
-            "Longitude": item["longitude"],
-            "status": item["status"]
-        })
+        for index, row in df.iterrows():
+            lat = row['Latitude']
+            lon = row['Longitude']
+            product = row['Product_Name']
+            
+            # Scrape the data
+            status = check_availability(lat, lon, product)
+            
+            result_entry = {
+                "run_id": run_id,
+                "product_name": product,
+                "latitude": lat,
+                "longitude": lon,
+                "status": status
+            }
+            
+            # Save to Supabase silently
+            supabase.table("automation_results").insert(result_entry).execute()
 
-    return {"message": "Success", "run_id": run_id, "results": ui_results}
+            current_count += 1
+            progress_pct = round((current_count / total_records) * 100)
+
+            # Stream the individual result to the React UI instantly
+            yield json.dumps({
+                "type": "result",
+                "progress": progress_pct,
+                "data": {
+                    "Product_Name": product,
+                    "Latitude": lat,
+                    "Longitude": lon,
+                    "status": status
+                }
+            }) + "\n"
+
+            # IP Protection delay between requests
+            await asyncio.sleep(random.uniform(3.0, 6.0))
+
+        # Signal completion
+        yield json.dumps({"type": "complete"}) + "\n"
+
+    # Return the streaming response instead of waiting for the loop to finish
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 if __name__ == "__main__":
     import uvicorn
