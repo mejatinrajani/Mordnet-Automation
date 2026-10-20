@@ -14,6 +14,7 @@ from geopy.exc import GeocoderTimedOut
 import requests
 import urllib.parse
 from scraper import check_availability
+from fastapi import Form, HTTPException
 
 load_dotenv()
 
@@ -89,8 +90,17 @@ def get_geo_details(location_name):
 async def process_scan(
     file: UploadFile = File(...),
     user_id: str = Form(...),
-    title: str = Form(...)
+    title: str = Form(...),
+    operator_name: str = Form(...),
+    passkey: str = Form(...)
 ):
+
+    # 1. SECURITY CHECK: Verify the operator and passkey in Supabase
+    auth_check = supabase.table("supervisors").select("*").eq("name", operator_name).eq("passkey", passkey).execute()
+    
+    if len(auth_check.data) == 0:
+        raise HTTPException(status_code=401, detail="Security Exception: Invalid passkey for this operator.")
+    
     contents = await file.read()
     df = pd.read_excel(io.BytesIO(contents))
     
@@ -105,7 +115,8 @@ async def process_scan(
         "user_id": user_id,
         "filename": file.filename,
         "total_locations": total_records,
-        "title": title
+        "title": title,
+        "operator_name": operator_name
     }).execute()
     
     run_id = run_response.data[0]['id']
