@@ -15,6 +15,7 @@ import requests
 import urllib.parse
 from scraper import check_availability
 from fastapi import Form, HTTPException
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
@@ -176,3 +177,11 @@ async def process_scan(
         yield json.dumps({"type": "complete"}) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.get("/api/health", tags=["Health"])
+def health_check():
+    """
+    Basic liveness probe to verify the service is awake and running.
+    """
+    return JSONResponse(content={"status": "awake", "message": "Backend is running and ready."})
