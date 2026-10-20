@@ -1,6 +1,14 @@
 import requests
 import urllib.parse
 import json
+import os
+import json
+from dotenv import load_dotenv 
+
+
+load_dotenv()
+
+BLINKIT_PROXY_URL = os.getenv("BLINKIT_PROXY_URL")
 
 def get_headers(lat, lon, encoded_product):
     return {
@@ -20,9 +28,14 @@ def check_availability(lat, lon, product_name):
     encoded_product = urllib.parse.quote(str(product_name))
     url = f"https://blinkit.com/v1/layout/search?q={encoded_product}&search_type=type_to_search"
     headers = get_headers(lat, lon, encoded_product)
+
+    proxies = {
+        "http": BLINKIT_PROXY_URL,
+        "https": BLINKIT_PROXY_URL
+    } if BLINKIT_PROXY_URL else None
     
     try:
-        response = requests.post(url, headers=headers, json={}, timeout=10)
+        response = requests.post(url, headers=headers, json={}, proxies=proxies, timeout=10)
         
         if response.status_code == 403:
             return "Blocked by Firewall"
