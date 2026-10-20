@@ -35,7 +35,7 @@ def check_availability(lat, lon, product_name):
     } if BLINKIT_PROXY_URL else None
     
     try:
-        response = requests.post(url, headers=headers, json={}, proxies=proxies, timeout=10)
+        response = requests.post(url, headers=headers, json={}, proxies=proxies, timeout=20)
         
         if response.status_code == 403:
             return "Blocked by Firewall"
