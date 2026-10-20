@@ -3,8 +3,8 @@ import { createClient } from '@supabase/supabase-js';
 import { 
   UploadCloud, Play, FileSpreadsheet, X, Activity, 
   CheckCircle2, AlertCircle, RefreshCw, Info,
-  Menu, Download, Plus, History, ChevronRight, FileText, ChevronLeft, Loader2,
-  Pin, Edit2, Trash2, Check, Search, Filter, Ban
+  Menu, Download, Plus, History, FileText, ChevronLeft, Loader2,
+  Pin, Edit2, Trash2, Check, Search, Filter, Ban, Eye, EyeOff
 } from 'lucide-react';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -36,6 +36,10 @@ export default function Home() {
 
   const [showNameModal, setShowNameModal] = useState(false);
   const [runTitle, setRunTitle] = useState("");
+  const [selectedOperator, setSelectedOperator] = useState("");
+  const [passkey, setPasskey] = useState("");
+  const [showPasskey, setShowPasskey] = useState(false);
+  const teamMembers = ["Shanky Saxena", "Neetu Sharma", "Arohi Singh", "Aryan", "Jatin Rajani"]
 
   // Prevent accidental page reload while processing
   useEffect(() => {
@@ -55,7 +59,7 @@ export default function Home() {
       const { data, error } = await supabase
         .from('automation_runs')
         .select(`
-          id, filename, title, is_pinned, total_locations, created_at,
+          id, filename, title, is_pinned, total_locations, created_at, operator_name,
           automation_results ( product_name, location_text, pincode, latitude, longitude, status )
         `)
         .order('created_at', { ascending: false });
@@ -70,6 +74,7 @@ export default function Home() {
         exit_code: '0 (Success)', 
         total_locations: run.total_locations,
         created_at: run.created_at,
+        operator: run.operator_name || "Unknown",
         results: run.automation_results.map(r => ({
           Product_Name: r.product_name, 
           Location: r.location_text,
@@ -139,7 +144,7 @@ export default function Home() {
     }
   };
 
-  const startAutomation = async (customTitle) => { // <--- Accept Title
+  const startAutomation = async (customTitle, operator, key) => { 
     if (!file) return;
     setStatus('processing');
     setLogs([{ time: new Date().toLocaleTimeString(), msg: 'Establishing live socket with FastAPI engine...' }]);
@@ -148,10 +153,15 @@ export default function Home() {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('user_id', 'user_123'); 
-    formData.append('title', customTitle); // <--- Send Title to Backend
+    formData.append('title', customTitle); 
+    formData.append('operator_name', operator);
+    formData.append('passkey', key);
 
     try {
       const response = await fetch('http://localhost:8000/api/scan', { method: 'POST', body: formData });
+      if (response.status === 401) {
+        throw new Error("Authentication Failed: Incorrect Passkey.");
+      }
       if (!response.ok) throw new Error("Backend connection failed");
 
       const reader = response.body.getReader();
@@ -297,6 +307,9 @@ export default function Home() {
                     </span>
                   )}
                   <p className="text-xs text-zinc-500">{session.date}</p>
+                  <span className="text-[10px] text-zinc-400 font-mono mt-1">
+                    By {session.operator} • {session.total_locations} Locs
+                  </span>
                   <span className="text-[10px] text-zinc-400 font-mono mt-1">{session.total_locations} Locs Validated</span>
                 </div>
               </div>
@@ -437,6 +450,7 @@ export default function Home() {
                 <table className="w-full text-left text-xs">
                   <thead className="bg-zinc-950/80 text-zinc-400 border-b border-zinc-800/60 uppercase tracking-wider">
                     <tr>
+                      <th className="px-6 py-4 font-medium w-16">Id</th>
                       <th className="px-6 py-4 font-medium">Product Name</th>
                       <th className="px-6 py-4 font-medium">Location</th>
                       <th className="px-6 py-4 font-medium">Pincode</th>
@@ -448,6 +462,7 @@ export default function Home() {
                   <tbody className="divide-y divide-zinc-800/40 text-zinc-300 font-mono">
                     {displayedResults.map((item, idx) => (
                       <tr key={idx} className="hover:bg-zinc-800/20 transition-colors">
+                        <td className="px-6 py-4 text-zinc-500 font-mono">{idx + 1}</td>
                         <td className="px-6 py-4 font-sans font-medium text-zinc-100">{item.Product_Name}</td>
                         <td className="px-6 py-4 text-zinc-300 truncate max-w-[150px]" title={item.Location}>{item.Location || 'N/A'}</td>
                         <td className="px-6 py-4 text-zinc-400 font-mono">{item.Pincode || 'N/A'}</td>
@@ -471,23 +486,63 @@ export default function Home() {
         {showNameModal && (
           <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
             <div className="bg-zinc-950 border border-zinc-800 p-6 rounded-2xl w-full max-w-md shadow-2xl animate-in fade-in zoom-in-95 duration-200">
-              <h3 className="text-lg font-bold text-zinc-100 mb-2">Name this Dispatch Session</h3>
-              <p className="text-sm text-zinc-400 mb-5">Assign a name so you can easily find this extraction in your history logs later.</p>
+              <h3 className="text-lg font-bold text-zinc-100 mb-2">Configure Execution</h3>
+              <p className="text-sm text-zinc-400 mb-5">Name this session and verify your operator identity to begin the extraction.</p>
               
-              <input 
-                type="text" 
-                value={runTitle} 
-                onChange={(e) => setRunTitle(e.target.value)}
-                className="w-full bg-zinc-900 border border-zinc-700 focus:border-blue-500 rounded-xl px-4 py-3 text-zinc-100 outline-none transition-colors mb-6"
-                placeholder="e.g., Delhi NCR Q3 Analysis"
-                autoFocus
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && runTitle.trim()) {
-                    setShowNameModal(false);
-                    startAutomation(runTitle.trim());
-                  }
-                }}
-              />
+              <div className="space-y-4 mb-6">
+                <div>
+                  <label className="text-xs font-medium text-zinc-400 mb-1.5 block">Session Title</label>
+                  <input 
+                    type="text" 
+                    value={runTitle} 
+                    onChange={(e) => setRunTitle(e.target.value)}
+                    className="w-full bg-zinc-900 border border-zinc-700 focus:border-blue-500 rounded-xl px-4 py-2.5 text-zinc-100 outline-none transition-colors"
+                    placeholder="e.g., Delhi NCR Q3 Analysis"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium text-zinc-400 mb-1.5 block">Operator Name</label>
+                  <select 
+                    value={selectedOperator} 
+                    onChange={(e) => { setSelectedOperator(e.target.value); setPasskey(""); }}
+                    className="w-full bg-zinc-900 border border-zinc-700 focus:border-blue-500 rounded-xl px-4 py-2.5 text-zinc-100 outline-none transition-colors appearance-none cursor-pointer"
+                  >
+                    <option value="" disabled>Select your name...</option>
+                    {teamMembers.map(member => (
+                      <option key={member} value={member}>{member}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {selectedOperator && (
+                  <div className="animate-in fade-in slide-in-from-top-2 duration-300">
+                    <label className="text-xs font-medium text-zinc-400 mb-1.5 block">Operator Passkey</label>
+                    <div className="relative">
+                      <input 
+                        type={showPasskey ? "text" : "password"} 
+                        value={passkey} 
+                        onChange={(e) => setPasskey(e.target.value)}
+                        className="w-full bg-zinc-900 border border-zinc-700 focus:border-blue-500 rounded-xl pl-4 pr-11 py-2.5 text-zinc-100 outline-none transition-colors"
+                        placeholder="Enter your operator passkey"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && runTitle.trim() && passkey.trim()) {
+                            setShowNameModal(false);
+                            startAutomation(runTitle.trim(), selectedOperator, passkey.trim());
+                          }
+                        }}
+                      />
+                      <button 
+                        type="button" 
+                        onClick={() => setShowPasskey(!showPasskey)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 transition-colors p-1"
+                      >
+                        {showPasskey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
               
               <div className="flex items-center justify-end gap-3">
                 <button 
@@ -497,14 +552,14 @@ export default function Home() {
                   Cancel
                 </button>
                 <button 
+                  disabled={!runTitle.trim() || !selectedOperator || !passkey.trim()}
                   onClick={() => {
-                    if(!runTitle.trim()) { alert("Please provide a name to continue."); return; }
                     setShowNameModal(false);
-                    startAutomation(runTitle.trim());
+                    startAutomation(runTitle.trim(), selectedOperator, passkey.trim());
                   }} 
-                  className="px-5 py-2.5 rounded-xl text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/20 transition-all"
+                  className="px-5 py-2.5 rounded-xl text-sm font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white shadow-lg shadow-blue-900/20 transition-all"
                 >
-                  Start Pipeline
+                  Authenticate & Run
                 </button>
               </div>
             </div>
