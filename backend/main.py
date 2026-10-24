@@ -29,12 +29,8 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", 
-        "https://mordnet-automation.vercel.app",
-        "https://mordnet-automation-8vqdochdm-arohijatin.vercel.app" # Your exact preview branch
-    ], 
-    allow_credentials=True,
+    allow_origins=["*"], 
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
