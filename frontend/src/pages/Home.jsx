@@ -171,58 +171,139 @@ export default function Home() {
 
   const startAutomation = async (customTitle, operator, key) => { 
     if (!file) return;
-    setStatus('processing');
-    setLogs([{ time: new Date().toLocaleTimeString(), msg: 'Establishing live socket with FastAPI engine...' }]);
-    setLiveResults([]); setProgress(0); setSearchTerm(""); setStatusFilter("All");
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('user_id', 'user_123'); 
-    formData.append('title', customTitle); 
-    formData.append('operator_name', operator);
-    formData.append('passkey', key);
+    try {
+      // 1. Read and parse the uploaded Excel/CSV file entirely in the browser
+      const data = await file.arrayBuffer();
+      const workbook = XLSX.read(data);
+      const sheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[sheetName];
+      
+      // defval: "" ensures that empty cells are read as empty strings, not skipped entirely
+      const allRows = XLSX.utils.sheet_to_json(worksheet, { defval: "" }); 
 
-    try { 
-      const backendUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-      const response = await fetch(`${backendUrl}/api/scan`, { method: 'POST', body: formData });
-      if (response.status === 401) {  
-        throw new Error("Authentication Failed: Incorrect Passkey.");
+      // ==========================================
+      // --- PRE-FLIGHT DATA VALIDATION STAGE ---
+      // ==========================================
+      if (!allRows.length) {
+        alert("Validation Failed: The uploaded file is completely empty.");
+        return; 
       }
-      if (!response.ok) throw new Error("Backend connection failed");
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
+      // Validate exact headers exist
+      const actualHeaders = Object.keys(allRows[0]);
+      if (!actualHeaders.includes("Location") || !actualHeaders.includes("Product_Name")) {
+        alert("Validation Failed: The file must contain exactly 'Location' and 'Product_Name' as column headers. Check for typos or extra spaces.");
+        return; 
+      }
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      // Scan all rows for empty cells or corrupted data
+      const corruptRows = [];
+      allRows.forEach((row, index) => {
+        const loc = String(row.Location).trim();
+        const prod = String(row.Product_Name).trim();
+        
+        // If either column is blank/missing
+        if (!loc || !prod) {
+          corruptRows.push(index + 2); // +2 because index 0 is Excel row 2 (row 1 is headers)
+        }
+      });
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop(); 
+      if (corruptRows.length > 0) {
+        const rowList = corruptRows.slice(0, 5).join(", ");
+        const extra = corruptRows.length > 5 ? ' (and more)' : '';
+        alert(`Validation Failed: Missing data detected on Excel row(s): ${rowList}${extra}. Every row must have both a Location and Product_Name.`);
+        return; // Halt the entire process before it even touches the backend
+      }
+      // ==========================================
+      // --- END VALIDATION ---
+      // ==========================================
 
-        for (const line of lines) {
-          if (line.trim() === "") continue;
-          const parsed = JSON.parse(line);
+      // If data is perfect, begin the UI state transitions
+      setStatus('processing');
+      setLogs([{ time: new Date().toLocaleTimeString(), msg: 'Data validated successfully. Preparing smart batches...' }]);
+      setLiveResults([]); setProgress(0); setSearchTerm(""); setStatusFilter("All");
 
-          if (parsed.type === "init") {
-            setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Pipeline open. Target size: ${parsed.total_locations} locations.` }, ...prev]);
-            fetchHistoricalSessions(); 
-          } else if (parsed.type === "result") {
-            setLiveResults(prev => [parsed.data, ...prev]);
-            setProgress(parsed.progress);
-            setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Validated ${parsed.data.Location} | ${parsed.data.Product_Name}: ${parsed.data.status}` }, ...prev].slice(0, 50));
-          } else if (parsed.type === "complete") {
-            setProgress(100); setStatus('completed');
-            setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Pipeline execution finished. Disconnecting stream.` }, ...prev]);
-            await fetchHistoricalSessions(); 
+      const totalLocations = allRows.length;
+      const batchSize = 30; // Smart chunking size
+      let completedLocations = 0;
+
+      setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Loaded ${totalLocations} valid rows. Splitting into ${Math.ceil(totalLocations / batchSize)} secure batches.` }, ...prev]);
+
+      // 2. Process sequentially in batches
+      for (let i = 0; i < totalLocations; i += batchSize) {
+        const chunk = allRows.slice(i, i + batchSize);
+        
+        const headers = ["Location", "Product_Name"];
+        const csvRows = chunk.map(row => `"${row.Location}","${row.Product_Name}"`);
+        const csvString = [headers.join(','), ...csvRows].join('\n');
+        
+        const chunkBlob = new Blob([csvString], { type: 'text/csv' });
+        const chunkFile = new File([chunkBlob], `batch_${i / batchSize + 1}.csv`, { type: 'text/csv' });
+
+        const formData = new FormData();
+        formData.append('file', chunkFile);
+        formData.append('user_id', 'user_123'); 
+        formData.append('title', `${customTitle} (Part ${i / batchSize + 1})`); 
+        formData.append('operator_name', operator);
+        formData.append('passkey', key);
+
+        const backendUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        
+        setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Dispatching Batch ${i / batchSize + 1}...` }, ...prev]);
+
+        // 3. Dispatch the chunk and listen to the stream
+        const response = await fetch(`${backendUrl}/api/scan`, { method: 'POST', body: formData });
+        
+        if (response.status === 401) {  
+          throw new Error("Authentication Failed: Incorrect Passkey.");
+        }
+        if (!response.ok) throw new Error(`Backend connection failed on batch ${i / batchSize + 1}`);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop(); 
+
+          for (const line of lines) {
+            if (line.trim() === "") continue;
+            const parsed = JSON.parse(line);
+
+            if (parsed.type === "init") {
+              fetchHistoricalSessions(); 
+            } else if (parsed.type === "result") {
+              setLiveResults(prev => [parsed.data, ...prev]);
+              completedLocations++;
+              
+              const globalProgress = Math.floor((completedLocations / totalLocations) * 100);
+              setProgress(globalProgress);
+              
+              setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Validated ${parsed.data.Location} | ${parsed.data.Product_Name}: ${parsed.data.status}` }, ...prev].slice(0, 50));
+            }
           }
         }
+        
+        if (i + batchSize < totalLocations) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
       }
+
+      // 4. Global Completion
+      setProgress(100); 
+      setStatus('completed');
+      setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `All batches successfully processed. Pipeline closed.` }, ...prev]);
+      await fetchHistoricalSessions(); 
+
     } catch (error) {
       setStatus('idle');
-      alert("Stream interrupted: " + error.message);
+      alert("Pipeline interrupted: " + error.message);
     }
   };
 
