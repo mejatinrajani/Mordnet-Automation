@@ -103,7 +103,12 @@ async def process_scan(
         raise HTTPException(status_code=401, detail="Security Exception: Invalid passkey for this operator.")
     
     contents = await file.read()
-    df = pd.read_excel(io.BytesIO(contents))
+    # NEW FIX: Parse as CSV since the frontend micro-batches are sent as text/csv blobs
+    try:
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+    except Exception as e:
+        # Fallback just in case the original Excel file slips through
+        df = pd.read_excel(io.BytesIO(contents))
     
     # 1. NEW VALIDATION: Check for 'Location' instead of Lat/Lon
     required_cols = ['Location', 'Product_Name']
