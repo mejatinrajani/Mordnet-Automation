@@ -173,64 +173,53 @@ export default function Home() {
     if (!file) return;
 
     try {
-      // 1. Read and parse the uploaded Excel/CSV file entirely in the browser
       const data = await file.arrayBuffer();
       const workbook = XLSX.read(data);
       const sheetName = workbook.SheetNames[0];
       const worksheet = workbook.Sheets[sheetName];
-      
-      // defval: "" ensures that empty cells are read as empty strings, not skipped entirely
       const allRows = XLSX.utils.sheet_to_json(worksheet, { defval: "" }); 
 
       // ==========================================
-      // --- PRE-FLIGHT DATA VALIDATION STAGE ---
+      // --- PRE-FLIGHT DATA VALIDATION ---
       // ==========================================
       if (!allRows.length) {
         alert("Validation Failed: The uploaded file is completely empty.");
         return; 
       }
 
-      // Validate exact headers exist
       const actualHeaders = Object.keys(allRows[0]);
       if (!actualHeaders.includes("Location") || !actualHeaders.includes("Product_Name")) {
-        alert("Validation Failed: The file must contain exactly 'Location' and 'Product_Name' as column headers. Check for typos or extra spaces.");
+        alert("Validation Failed: The file must contain exactly 'Location' and 'Product_Name' headers.");
         return; 
       }
 
-      // Scan all rows for empty cells or corrupted data
       const corruptRows = [];
       allRows.forEach((row, index) => {
-        const loc = String(row.Location).trim();
-        const prod = String(row.Product_Name).trim();
-        
-        // If either column is blank/missing
-        if (!loc || !prod) {
-          corruptRows.push(index + 2); // +2 because index 0 is Excel row 2 (row 1 is headers)
+        if (!String(row.Location).trim() || !String(row.Product_Name).trim()) {
+          corruptRows.push(index + 2); 
         }
       });
 
       if (corruptRows.length > 0) {
         const rowList = corruptRows.slice(0, 5).join(", ");
         const extra = corruptRows.length > 5 ? ' (and more)' : '';
-        alert(`Validation Failed: Missing data detected on Excel row(s): ${rowList}${extra}. Every row must have both a Location and Product_Name.`);
-        return; // Halt the entire process before it even touches the backend
+        alert(`Validation Failed: Missing data detected on Excel row(s): ${rowList}${extra}.`);
+        return; 
       }
       // ==========================================
-      // --- END VALIDATION ---
-      // ==========================================
 
-      // If data is perfect, begin the UI state transitions
       setStatus('processing');
-      setLogs([{ time: new Date().toLocaleTimeString(), msg: 'Data validated successfully. Preparing smart batches...' }]);
+      setLogs([{ time: new Date().toLocaleTimeString(), msg: 'Data validated. Engaging micro-batches...' }]);
       setLiveResults([]); setProgress(0); setSearchTerm(""); setStatusFilter("All");
 
       const totalLocations = allRows.length;
-      const batchSize = 30; // Smart chunking size
+      
+      // DECREASED TO 5: This guarantees a batch completes in ~50 seconds, bypassing all cloud limits
+      const batchSize = 5; 
       let completedLocations = 0;
 
-      setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Loaded ${totalLocations} valid rows. Splitting into ${Math.ceil(totalLocations / batchSize)} secure batches.` }, ...prev]);
+      setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Loaded ${totalLocations} valid rows. Splitting into ${Math.ceil(totalLocations / batchSize)} micro-batches.` }, ...prev]);
 
-      // 2. Process sequentially in batches
       for (let i = 0; i < totalLocations; i += batchSize) {
         const chunk = allRows.slice(i, i + batchSize);
         
@@ -250,52 +239,71 @@ export default function Home() {
 
         const backendUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
         
-        setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Dispatching Batch ${i / batchSize + 1}...` }, ...prev]);
+        setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Dispatching Micro-Batch ${i / batchSize + 1}...` }, ...prev]);
 
-        // 3. Dispatch the chunk and listen to the stream
-        const response = await fetch(`${backendUrl}/api/scan`, { method: 'POST', body: formData });
+        // THE WATCHDOG TIMER: Aborts the fetch if it hangs
+        const controller = new AbortController();
         
-        if (response.status === 401) {  
-          throw new Error("Authentication Failed: Incorrect Passkey.");
-        }
-        if (!response.ok) throw new Error(`Backend connection failed on batch ${i / batchSize + 1}`);
+        try {
+          const response = await fetch(`${backendUrl}/api/scan`, { 
+            method: 'POST', 
+            body: formData,
+            signal: controller.signal
+          });
+          
+          if (response.status === 401) throw new Error("Authentication Failed: Incorrect Passkey.");
+          if (!response.ok) throw new Error(`Backend connection failed on batch ${i / batchSize + 1}`);
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+          let watchdog;
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
+          while (true) {
+            // Reset watchdog: If the proxy gets stuck and sends no data for 60 seconds, cut the cord to prevent freezing
+            clearTimeout(watchdog);
+            watchdog = setTimeout(() => controller.abort(), 60000); 
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop(); 
+            const { value, done } = await reader.read();
+            
+            if (done) {
+              clearTimeout(watchdog);
+              break;
+            }
 
-          for (const line of lines) {
-            if (line.trim() === "") continue;
-            const parsed = JSON.parse(line);
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); 
 
-            if (parsed.type === "init") {
-              fetchHistoricalSessions(); 
-            } else if (parsed.type === "result") {
-              setLiveResults(prev => [parsed.data, ...prev]);
-              completedLocations++;
-              
-              const globalProgress = Math.floor((completedLocations / totalLocations) * 100);
-              setProgress(globalProgress);
-              
-              setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Validated ${parsed.data.Location} | ${parsed.data.Product_Name}: ${parsed.data.status}` }, ...prev].slice(0, 50));
+            for (const line of lines) {
+              if (line.trim() === "") continue;
+              const parsed = JSON.parse(line);
+
+              if (parsed.type === "init") {
+                fetchHistoricalSessions(); 
+              } else if (parsed.type === "result") {
+                setLiveResults(prev => [parsed.data, ...prev]);
+                completedLocations++;
+                
+                const globalProgress = Math.floor((completedLocations / totalLocations) * 100);
+                setProgress(globalProgress);
+                
+                setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Validated ${parsed.data.Location} | ${parsed.data.Product_Name}: ${parsed.data.status}` }, ...prev].slice(0, 50));
+              }
             }
           }
+        } catch (streamError) {
+          if (streamError.name === 'AbortError') {
+             throw new Error(`Micro-Batch ${i / batchSize + 1} stalled. The residential proxy timed out and the watchdog severed the connection to save the UI. Resume from row ${completedLocations + 2}.`);
+          }
+          throw streamError;
         }
         
         if (i + batchSize < totalLocations) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await new Promise(resolve => setTimeout(resolve, 1500)); // Brief cooldown
         }
       }
 
-      // 4. Global Completion
       setProgress(100); 
       setStatus('completed');
       setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `All batches successfully processed. Pipeline closed.` }, ...prev]);
