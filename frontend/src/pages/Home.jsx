@@ -5,8 +5,9 @@ import {
   CheckCircle2, AlertCircle, RefreshCw, Info,
   Menu, Download, Plus, History, FileText, ChevronLeft, Loader2,
   Pin, Edit2, Trash2, Check, Search, Filter, Ban, Eye, EyeOff,
-  Sun, Moon // Added for Theme Toggle
+  Sun, Moon 
 } from 'lucide-react';
+import * as XLSX from 'xlsx';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
