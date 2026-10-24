@@ -2,10 +2,8 @@ import requests
 import urllib.parse
 import json
 import os
-import json
 import time
 from dotenv import load_dotenv 
-
 
 load_dotenv()
 
@@ -63,8 +61,11 @@ def check_availability(lat, lon, product_name, max_retries=3):
             if not snippets:
                 return "Not Found"
                 
-            target_product_lower = str(product_name).lower()
             found_product = False
+            
+            # Break target name into individual lowercase words for flexible matching
+            target_words = str(product_name).lower().split()
+            target_length = len(target_words)
             
             # Traverse snippets and carousels
             for snippet in snippets:
@@ -75,13 +76,21 @@ def check_availability(lat, lon, product_name, max_retries=3):
                 if not product_text:
                     product_text = snippet_data.get("display_name", {}).get("text", "")
                     
-                if product_text and target_product_lower in product_text.lower():
-                    found_product = True
-                    inventory = snippet_data.get("inventory", 0)
-                    is_sold_out = snippet_data.get("is_sold_out", False)
+                if product_text and target_length > 0:
+                    product_text_lower = product_text.lower()
+                    matches = sum(1 for word in target_words if word in product_text_lower)
+                    match_ratio = matches / target_length
                     
-                    if inventory > 0 and not is_sold_out:
-                        return "Yes"
+                    # DEBUG: Prints to your FastAPI terminal to show what Blinkit actually returned
+                    print(f"[DEBUG] Searched: '{product_name}' | Found: '{product_text}' | Ratio: {match_ratio:.2f}")
+
+                    if match_ratio >= 0.75:
+                        found_product = True
+                        inventory = snippet_data.get("inventory", 0)
+                        is_sold_out = snippet_data.get("is_sold_out", False)
+                        
+                        if inventory > 0 and not is_sold_out:
+                            return "Yes"
                         
                 # 2. Check nested carousels
                 if "itemList" in snippet_data:
@@ -91,13 +100,20 @@ def check_availability(lat, lon, product_name, max_retries=3):
                         if not item_text:
                             item_text = item_data.get("display_name", {}).get("text", "")
                         
-                        if item_text and target_product_lower in item_text.lower():
-                            found_product = True
-                            inventory = item_data.get("inventory", 0)
-                            is_sold_out = item_data.get("is_sold_out", False)
+                        if item_text and target_length > 0:
+                            item_text_lower = item_text.lower()
+                            matches = sum(1 for word in target_words if word in item_text_lower)
+                            match_ratio = matches / target_length
                             
-                            if inventory > 0 and not is_sold_out:
-                                return "Yes"
+                            print(f"[DEBUG - Carousel] Searched: '{product_name}' | Found: '{item_text}' | Ratio: {match_ratio:.2f}")
+
+                            if match_ratio >= 0.75:
+                                found_product = True
+                                inventory = item_data.get("inventory", 0)
+                                is_sold_out = item_data.get("is_sold_out", False)
+                                
+                                if inventory > 0 and not is_sold_out:
+                                    return "Yes"
                                 
             if found_product:
                 return "Currently Out of Stock"
@@ -108,7 +124,7 @@ def check_availability(lat, lon, product_name, max_retries=3):
             last_exception = e
             # On network stall or timeout, rotating proxies provide a fresh IP on the next iteration
             if attempt < max_retries:
-                time.sleep(1)
+                time.sleep(2)
                 continue
         except json.JSONDecodeError:
             return "Not Found"
