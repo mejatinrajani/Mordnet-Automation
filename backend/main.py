@@ -1,23 +1,35 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
+from typing import Optional
+from dotenv import load_dotenv 
+from geopy.geocoders import Nominatim
+from tenacity import retry, stop_after_attempt, wait_exponential
 import pandas as pd
 import io
 import asyncio
 import random
 import os
 import json
-from dotenv import load_dotenv 
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut
 import requests
 import urllib.parse
-from scraper import check_availability
-from fastapi import Form, HTTPException
-from fastapi.responses import JSONResponse
+import logging
 
+# Import your external scraper function
+from scraper import check_availability
+
+# ==========================================
+# 1. SETUP & CONFIGURATION
+# ==========================================
 load_dotenv()
+
+# Structured Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -37,118 +49,148 @@ app.add_middleware(
 
 geolocator = Nominatim(user_agent="blinkit_locator_enterprise")
 
+# ==========================================
+# 2. RETRY-ENABLED EXTERNAL CALLS
+# ==========================================
+
+# Wrap the imported scraper so it safely retries on proxy drops
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+def run_scraper_with_retry(lat, lon, product):
+    return check_availability(lat, lon, product)
+
+# Added retry decorator. Removed the broad try/except so network failures trigger the retry!
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 def get_geo_details(location_name):
     if not MAPBOX_ACCESS_TOKEN:
-        print("Error: MAPBOX_ACCESS_TOKEN not found in .env file.")
+        logger.error("MAPBOX_ACCESS_TOKEN not found in .env file.")
         return None, None, "API Key Missing"
 
     encoded_location = urllib.parse.quote(str(location_name))
     mapbox_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded_location}.json?country=in&access_token={MAPBOX_ACCESS_TOKEN}"
     
-    try:
-        # 1. PRIMARY GEOCODER: Mapbox (For high-accuracy Lat/Lon)
-        response = requests.get(mapbox_url, timeout=10).json()
+    # 1. PRIMARY GEOCODER: Mapbox
+    response = requests.get(mapbox_url, timeout=10)
+    response.raise_for_status() # Forces a retry if the API returns 500/502
+    mapbox_data = response.json()
+    
+    if "features" in mapbox_data and len(mapbox_data["features"]) > 0:
+        best_match = mapbox_data["features"][0]
+        lon, lat = best_match["center"]
         
-        if "features" in response and len(response["features"]) > 0:
-            best_match = response["features"][0]
-            lon, lat = best_match["center"]
-            
-            pincode = "Not Found"
-            
-            # Mapbox Pincode Extraction Logic
-            if "postcode" in best_match.get("place_type", []):
-                pincode = best_match["text"]
-            else:
-                for context in best_match.get("context", []):
-                    if context["id"].startswith("postcode"):
-                        pincode = context["text"]
-                        break
-            
-            # 2. FALLBACK GEOCODER: OpenStreetMap (If Mapbox misses the Pincode)
-            if pincode == "Not Found":
-                try:
-                    # We reverse-geocode the exact Mapbox coordinates to force OSM to yield the postal code
-                    osm_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
-                    osm_headers = {"User-Agent": "blinkit_enterprise_monitor"}
-                    
-                    osm_response = requests.get(osm_url, headers=osm_headers, timeout=5).json()
-                    
-                    if "address" in osm_response and "postcode" in osm_response["address"]:
-                        pincode = osm_response["address"]["postcode"]
-                except Exception as osm_error:
-                    print(f"OSM Fallback failed for {location_name}: {osm_error}")
-
-            return lat, lon, pincode
-            
-        return None, None, "Not Found"
+        pincode = "Not Found"
         
-    except Exception as e:
-        print(f"Geocoding error for {location_name}: {e}")
-        return None, None, "Error"
+        # Mapbox Pincode Extraction Logic
+        if "postcode" in best_match.get("place_type", []):
+            pincode = best_match["text"]
+        else:
+            for context in best_match.get("context", []):
+                if context["id"].startswith("postcode"):
+                    pincode = context["text"]
+                    break
+        
+        # 2. FALLBACK GEOCODER: OpenStreetMap
+        if pincode == "Not Found":
+            try:
+                osm_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+                osm_headers = {"User-Agent": "blinkit_enterprise_monitor"}
+                osm_response = requests.get(osm_url, headers=osm_headers, timeout=5)
+                osm_response.raise_for_status()
+                osm_data = osm_response.json()
+                
+                if "address" in osm_data and "postcode" in osm_data["address"]:
+                    pincode = osm_data["address"]["postcode"]
+            except Exception as osm_error:
+                logger.warning(f"OSM Fallback failed for {location_name}: {osm_error}")
 
-# Chunked Transfer Encoding (Streaming)
+        return lat, lon, pincode
+        
+    return None, None, "Not Found"
+
+
+# ==========================================
+# 3. CORE PIPELINE
+# ==========================================
 @app.post("/api/scan")
 async def process_scan(
     file: UploadFile = File(...),
     user_id: str = Form(...),
     title: str = Form(...),
     operator_name: str = Form(...),
-    passkey: str = Form(...)
+    passkey: str = Form(...),
+    master_total: int = Form(...),
+    run_id: Optional[str] = Form(None)
 ):
-
-    # 1. SECURITY CHECK: Verify the operator and passkey in Supabase
+    # Security Check
     auth_check = supabase.table("supervisors").select("*").eq("name", operator_name).eq("passkey", passkey).execute()
-    
     if len(auth_check.data) == 0:
+        logger.warning(f"Unauthorized access attempt by operator: {operator_name}")
         raise HTTPException(status_code=401, detail="Security Exception: Invalid passkey for this operator.")
     
     contents = await file.read()
-    # NEW FIX: Parse as CSV since the frontend micro-batches are sent as text/csv blobs
+    
+    # Payload Size Limit (Max 5MB per chunk)
+    if len(contents) > 5 * 1024 * 1024:
+        logger.error(f"Payload from {operator_name} exceeded 5MB limit.")
+        raise HTTPException(status_code=413, detail="Payload too large.")
+    
+    # Parse as CSV (or fallback to Excel)
     try:
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-    except Exception as e:
-        # Fallback just in case the original Excel file slips through
+    except Exception:
         df = pd.read_excel(io.BytesIO(contents))
     
-    # 1. NEW VALIDATION: Check for 'Location' instead of Lat/Lon
+    # Validation
     required_cols = ['Location', 'Product_Name']
     if not all(col in df.columns for col in required_cols):
         return {"error": f"Missing required columns. Found: {list(df.columns)}"}
 
+    # Data Sanitization & Deduplication
+    df['Location'] = df['Location'].astype(str).str.strip().replace(r'\xa0', ' ', regex=True)
+    df['Product_Name'] = df['Product_Name'].astype(str).str.strip().replace(r'\xa0', ' ', regex=True)
+    df = df.drop_duplicates(subset=['Location', 'Product_Name'])
+
     total_records = len(df)
 
-    run_response = supabase.table("automation_runs").insert({
-        "user_id": user_id,
-        "filename": file.filename,
-        "total_locations": total_records,
-        "title": title,
-        "operator_name": operator_name
-    }).execute()
-    
-    run_id = run_response.data[0]['id']
+    # Session Linking Logic
+    if not run_id or run_id == "null" or run_id == "":
+        run_response = supabase.table("automation_runs").insert({
+            "user_id": user_id,
+            "filename": file.filename,
+            "total_locations": master_total, 
+            "title": title,
+            "operator_name": operator_name
+        }).execute()
+        current_run_id = run_response.data[0]['id']
+        logger.info(f"Initialized new Master Run: {current_run_id} ({master_total} locations)")
+    else:
+        current_run_id = run_id
 
     async def event_stream():
-        yield json.dumps({"type": "init", "run_id": run_id, "total_locations": total_records}) + "\n"
+        yield json.dumps({"type": "init", "run_id": current_run_id, "total_locations": master_total}) + "\n"
 
         current_count = 0
 
         for index, row in df.iterrows():
-            raw_location = str(row['Location'])
-            product = str(row['Product_Name'])
+            raw_location = row['Location']
+            product = row['Product_Name']
             
-            # 2. NEW LOGIC: Convert text to coordinates
-            lat, lon, pincode = get_geo_details(raw_location)
-            
-            # If geocoding completely fails
-            if lat is None:
-                status = "Invalid Address"
-            else:
-                # Run your blinkit scraper
-                status = check_availability(lat, lon, product)
-            
-            # 3. NEW DB ENTRY: Save the new fields
+            # Defensive execution block
+            try:
+                lat, lon, pincode = get_geo_details(raw_location)
+                
+                if lat is None:
+                    status = "Invalid Address"
+                else:
+                    status = run_scraper_with_retry(lat, lon, product)
+            except Exception as e:
+                # If it fails 3 times, Tenacity drops it here instead of crashing the server
+                status = "Proxy/Network Timeout"
+                logger.error(f"[{current_run_id}] Pipeline exception on {raw_location}: {str(e)}")
+                lat, lon, pincode = None, None, None
+
+            # DB Entry - USING current_run_id
             result_entry = {
-                "run_id": run_id,
+                "run_id": current_run_id,
                 "product_name": product,
                 "location_text": raw_location,
                 "pincode": pincode,
@@ -162,7 +204,7 @@ async def process_scan(
             current_count += 1
             progress_pct = round((current_count / total_records) * 100)
 
-            # 4. STREAM NEW PAYLOAD
+            # Stream payload
             yield json.dumps({
                 "type": "result",
                 "progress": progress_pct,

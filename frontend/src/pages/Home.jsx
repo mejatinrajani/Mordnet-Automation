@@ -220,7 +220,7 @@ export default function Home() {
       let completedLocations = 0;
 
       setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Loaded ${totalLocations} valid rows. Splitting into ${Math.ceil(totalLocations / batchSize)} micro-batches.` }, ...prev]);
-
+      let activeRunId = "";
       for (let i = 0; i < totalLocations; i += batchSize) {
         const chunk = allRows.slice(i, i + batchSize);
         
@@ -233,11 +233,12 @@ export default function Home() {
 
         const formData = new FormData();
         formData.append('file', chunkFile);
-        formData.append('user_id', 'user_123'); 
-        formData.append('title', `${customTitle} (Part ${i / batchSize + 1})`); 
+        formData.append('user_id', 'user_123');
+        formData.append('title', customTitle); 
         formData.append('operator_name', operator);
         formData.append('passkey', key);
-
+        formData.append('master_total', totalLocations);
+        formData.append('run_id', activeRunId);
         const backendUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
         
         setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `Dispatching Micro-Batch ${i / batchSize + 1}...` }, ...prev]);
@@ -281,7 +282,10 @@ export default function Home() {
               const parsed = JSON.parse(line);
 
               if (parsed.type === "init") {
-                fetchHistoricalSessions(); 
+                if (!activeRunId) {
+                  activeRunId = parsed.run_id;
+                  fetchHistoricalSessions();
+                }
               } else if (parsed.type === "result") {
                 setLiveResults(prev => [parsed.data, ...prev]);
                 completedLocations++;

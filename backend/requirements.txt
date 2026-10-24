@@ -7,3 +7,4 @@ supabase
 requests
 python-dotenv
 geopy
+tenacity
